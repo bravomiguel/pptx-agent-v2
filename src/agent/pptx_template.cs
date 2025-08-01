@@ -1,3 +1,5 @@
+#r "nuget: DocumentFormat.OpenXml, 3.0.0"
+
 using System;
 using System.Linq;
 using DocumentFormat.OpenXml.Packaging;
@@ -6,33 +8,21 @@ using DocumentFormat.OpenXml;
 using P = DocumentFormat.OpenXml.Presentation;
 using D = DocumentFormat.OpenXml.Drawing;
 
-public class PptxEditor
+string filePath = Args[0];
+
+try
 {
-    public static void Main(string[] args)
+    using (PresentationDocument presentation = PresentationDocument.Open(filePath, true))
     {
-        if (args.Length < 1)
-        {
-            Console.WriteLine("Error: Please provide the PowerPoint file path");
-            Environment.Exit(1);
-        }
+        // USER_CODE_START
+        {CODE}
+        // USER_CODE_END
         
-        string filePath = args[0];
-        
-        try
-        {
-            using (PresentationDocument presentation = PresentationDocument.Open(filePath, true))
-            {
-                // USER_CODE_START
-                {CODE}
-                // USER_CODE_END
-                
-                Console.WriteLine("Successfully executed PowerPoint modifications");
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Error: {ex.Message}");
-            Environment.Exit(1);
-        }
+        Console.WriteLine("Successfully executed PowerPoint modifications");
     }
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"Error: {ex.Message}");
+    Environment.Exit(1);
 }

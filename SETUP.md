@@ -27,18 +27,17 @@ sudo apt-get update
 sudo apt-get install -y dotnet-sdk-8.0
 ```
 
-### 2. Install DocumentFormat.OpenXml
+### 2. Install dotnet-script
 
 ```bash
+# Install dotnet-script globally
 dotnet tool install -g dotnet-script
-dotnet add package DocumentFormat.OpenXml
+
+# Verify installation
+dotnet script --version
 ```
 
-Or create a global tool manifest:
-```bash
-dotnet new tool-manifest
-dotnet tool install dotnet-script
-```
+Note: The DocumentFormat.OpenXml package will be automatically downloaded when the script runs for the first time.
 
 ### 3. Install Python Dependencies
 

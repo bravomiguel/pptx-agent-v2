@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -37,7 +38,7 @@ class State:
 SYSTEM_PROMPT = """You are a PowerPoint editing assistant that uses C# code with the .NET Open XML SDK to modify presentations.
 
 When editing PowerPoint files:
-1. ALWAYS explain what you're about to do in plain english before generating code (but don't actually show the code to the user)
+1. ALWAYS explain what you're about to do before generating code (but don't include actual code in your explanations)
 2. Generate C# code that focuses on ONE slide at a time
 3. Use clear variable names and include error handling
 4. After each operation, report the results clearly
@@ -77,7 +78,8 @@ async def execute_csharp_code(code: str, pptx_file_path: str) -> dict:
     template_path = os.path.join(os.path.dirname(__file__), "pptx_template.cs")
     if not await asyncio.to_thread(os.path.exists, template_path):
         # Create a basic template if it doesn't exist
-        template_content = """
+        template_content = """#r "nuget: DocumentFormat.OpenXml, 3.0.0"
+
 using System;
 using System.Linq;
 using DocumentFormat.OpenXml.Packaging;
@@ -86,35 +88,23 @@ using DocumentFormat.OpenXml;
 using P = DocumentFormat.OpenXml.Presentation;
 using D = DocumentFormat.OpenXml.Drawing;
 
-public class PptxEditor
+string filePath = Args[0];
+
+try
 {
-    public static void Main(string[] args)
+    using (PresentationDocument presentation = PresentationDocument.Open(filePath, true))
     {
-        if (args.Length < 1)
-        {
-            Console.WriteLine("Error: Please provide the PowerPoint file path");
-            Environment.Exit(1);
-        }
+        // USER_CODE_START
+        {CODE}
+        // USER_CODE_END
         
-        string filePath = args[0];
-        
-        try
-        {
-            using (PresentationDocument presentation = PresentationDocument.Open(filePath, true))
-            {
-                // USER_CODE_START
-                {CODE}
-                // USER_CODE_END
-                
-                Console.WriteLine("Successfully executed PowerPoint modifications");
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Error: {ex.Message}");
-            Environment.Exit(1);
-        }
+        Console.WriteLine("Successfully executed PowerPoint modifications");
     }
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"Error: {ex.Message}");
+    Environment.Exit(1);
 }
 """
         async with aiofiles.open(template_path, 'w') as f:
@@ -137,45 +127,125 @@ public class PptxEditor
         await f.write(full_code)
     
     try:
-        # Try to run with dotnet script first (if available)
-        result = await asyncio.to_thread(
+        # First check if dotnet-script is installed
+        check_result = await asyncio.to_thread(
             subprocess.run,
-            ['dotnet', 'script', cs_file, '--', pptx_file_path],
+            ['dotnet', 'tool', 'list', '--global'],
             capture_output=True,
-            text=True,
-            timeout=30
+            text=True
         )
         
-        if result.returncode == 0:
-            return {"success": True, "output": result.stdout}
-        else:
-            # If dotnet script fails, try compiling and running
-            exe_file = cs_file.replace('.cs', '.exe')
+        has_dotnet_script = 'dotnet-script' in check_result.stdout
+        
+        if not has_dotnet_script:
+            # Try to run directly with dotnet run instead
+            # Create a simple project file
+            proj_content = """<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="DocumentFormat.OpenXml" Version="3.0.0" />
+  </ItemGroup>
+</Project>"""
             
-            # Compile
-            compile_result = await asyncio.to_thread(
+            # Create project in temp directory
+            temp_dir = await asyncio.to_thread(tempfile.mkdtemp)
+            proj_file = os.path.join(temp_dir, "temp.csproj")
+            cs_file_in_dir = os.path.join(temp_dir, "Program.cs")
+            
+            # Write project file
+            async with aiofiles.open(proj_file, 'w') as f:
+                await f.write(proj_content)
+            
+            # Modify the code to have a proper Main method
+            modified_code = full_code.replace('#r "nuget: DocumentFormat.OpenXml, 3.0.0"\n\n', '')
+            modified_code = modified_code.replace('string filePath = Args[0];', '''public class Program
+{
+    public static void Main(string[] args)
+    {
+        if (args.Length < 1)
+        {
+            Console.WriteLine("Error: Please provide the PowerPoint file path");
+            Environment.Exit(1);
+        }
+        string filePath = args[0];''')
+            modified_code = modified_code.rstrip() + '\n    }\n}'
+            
+            # Write the C# file
+            async with aiofiles.open(cs_file_in_dir, 'w') as f:
+                await f.write(modified_code)
+            
+            # First restore packages
+            restore_result = await asyncio.to_thread(
                 subprocess.run,
-                ['csc', '-reference:DocumentFormat.OpenXml.dll', cs_file, f'-out:{exe_file}'],
+                ['dotnet', 'restore', proj_file],
                 capture_output=True,
-                text=True
+                text=True,
+                timeout=30,
+                cwd=temp_dir
             )
             
-            if compile_result.returncode != 0:
-                return {"success": False, "error": f"Compilation error: {compile_result.stderr}"}
+            if restore_result.returncode != 0:
+                await asyncio.to_thread(shutil.rmtree, temp_dir)
+                return {"success": False, "error": f"Package restore failed: {restore_result.stderr}"}
             
-            # Run
-            run_result = await asyncio.to_thread(
+            # Build first to get better error messages
+            build_result = await asyncio.to_thread(
                 subprocess.run,
-                [exe_file, pptx_file_path],
+                ['dotnet', 'build', proj_file, '--no-restore'],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=temp_dir
+            )
+            
+            if build_result.returncode != 0:
+                # Read the generated C# file to help debug
+                async with aiofiles.open(cs_file_in_dir, 'r') as f:
+                    generated_code = await f.read()
+                await asyncio.to_thread(shutil.rmtree, temp_dir)
+                return {"success": False, "error": f"Build failed:\n{build_result.stderr}\n\nGenerated code:\n{generated_code[:1000]}..."}
+            
+            # Run with dotnet run
+            result = await asyncio.to_thread(
+                subprocess.run,
+                ['dotnet', 'run', '--project', proj_file, '--no-build', '--', pptx_file_path],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                cwd=temp_dir
+            )
+            
+            # Clean up temp directory
+            await asyncio.to_thread(shutil.rmtree, temp_dir)
+            
+        else:
+            # Try to run with dotnet script
+            result = await asyncio.to_thread(
+                subprocess.run,
+                ['dotnet', 'script', cs_file, '--', pptx_file_path],
                 capture_output=True,
                 text=True,
                 timeout=30
             )
+        
+        if result.returncode == 0:
+            return {"success": True, "output": result.stdout}
+        else:
+            # If dotnet script fails, provide helpful error message
+            error_msg = result.stderr or result.stdout
             
-            if run_result.returncode == 0:
-                return {"success": True, "output": run_result.stdout}
-            else:
-                return {"success": False, "error": run_result.stderr or run_result.stdout}
+            # Check if it's a missing package error
+            if "DocumentFormat.OpenXml" in error_msg:
+                return {"success": False, "error": "DocumentFormat.OpenXml package not found. Please install it:\n1. Run: dotnet tool install -g dotnet-script\n2. Create a script.csx file with: #r \"nuget: DocumentFormat.OpenXml, 3.0.0\"\n3. Run: dotnet script script.csx to install the package"}
+            
+            # Check if dotnet script is not installed
+            if "dotnet-script" in error_msg or "No executable found" in error_msg:
+                return {"success": False, "error": "dotnet-script not installed. Please run: dotnet tool install -g dotnet-script"}
+            
+            return {"success": False, "error": f"Execution error: {error_msg}"}
             
     except subprocess.TimeoutExpired:
         return {"success": False, "error": "Code execution timed out after 30 seconds"}
@@ -211,7 +281,7 @@ async def pptx_tool(code: str, pptx_file_path: str) -> str:
 async def llm_node(state: State, config: RunnableConfig) -> dict:
     """LLM node that decides actions and generates code."""
     # Initialize the LLM with tools
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    llm = ChatOpenAI(model="gpt-4.1", temperature=0)
     
     # Bind the tool with the current file path
     if state.pptx_file_path:
