@@ -6,12 +6,14 @@ using the .NET Open XML SDK.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from typing import Annotated, Literal, Optional, Sequence
 
+import aiofiles
 from langchain_core.messages import AnyMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
@@ -35,7 +37,7 @@ class State:
 SYSTEM_PROMPT = """You are a PowerPoint editing assistant that uses C# code with the .NET Open XML SDK to modify presentations.
 
 When editing PowerPoint files:
-1. ALWAYS explain what you're about to do before generating code
+1. ALWAYS explain what you're about to do in plain english before generating code (but don't actually show the code to the user)
 2. Generate C# code that focuses on ONE slide at a time
 3. Use clear variable names and include error handling
 4. After each operation, report the results clearly
@@ -61,7 +63,7 @@ var slide = slidePart.Slide;
 Always be conversational and helpful in your responses."""
 
 
-def execute_csharp_code(code: str, pptx_file_path: str) -> dict:
+async def execute_csharp_code(code: str, pptx_file_path: str) -> dict:
     """Execute C# code that modifies a PowerPoint file.
     
     Args:
@@ -73,7 +75,7 @@ def execute_csharp_code(code: str, pptx_file_path: str) -> dict:
     """
     # Read the C# template
     template_path = os.path.join(os.path.dirname(__file__), "pptx_template.cs")
-    if not os.path.exists(template_path):
+    if not await asyncio.to_thread(os.path.exists, template_path):
         # Create a basic template if it doesn't exist
         template_content = """
 using System;
@@ -115,23 +117,29 @@ public class PptxEditor
     }
 }
 """
-        with open(template_path, 'w') as f:
-            f.write(template_content)
+        async with aiofiles.open(template_path, 'w') as f:
+            await f.write(template_content)
     else:
-        with open(template_path, 'r') as f:
-            template_content = f.read()
+        async with aiofiles.open(template_path, 'r') as f:
+            template_content = await f.read()
     
     # Replace the code placeholder
     full_code = template_content.replace("{CODE}", code)
     
     # Create a temporary C# file
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.cs', delete=False) as f:
-        f.write(full_code)
-        cs_file = f.name
+    def create_temp_file():
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.cs', delete=False) as f:
+            return f.name
+    
+    cs_file = await asyncio.to_thread(create_temp_file)
+    
+    async with aiofiles.open(cs_file, 'w') as f:
+        await f.write(full_code)
     
     try:
         # Try to run with dotnet script first (if available)
-        result = subprocess.run(
+        result = await asyncio.to_thread(
+            subprocess.run,
             ['dotnet', 'script', cs_file, '--', pptx_file_path],
             capture_output=True,
             text=True,
@@ -145,7 +153,8 @@ public class PptxEditor
             exe_file = cs_file.replace('.cs', '.exe')
             
             # Compile
-            compile_result = subprocess.run(
+            compile_result = await asyncio.to_thread(
+                subprocess.run,
                 ['csc', '-reference:DocumentFormat.OpenXml.dll', cs_file, f'-out:{exe_file}'],
                 capture_output=True,
                 text=True
@@ -155,7 +164,8 @@ public class PptxEditor
                 return {"success": False, "error": f"Compilation error: {compile_result.stderr}"}
             
             # Run
-            run_result = subprocess.run(
+            run_result = await asyncio.to_thread(
+                subprocess.run,
                 [exe_file, pptx_file_path],
                 capture_output=True,
                 text=True,
@@ -173,14 +183,14 @@ public class PptxEditor
         return {"success": False, "error": str(e)}
     finally:
         # Clean up temporary files
-        if os.path.exists(cs_file):
-            os.unlink(cs_file)
+        if await asyncio.to_thread(os.path.exists, cs_file):
+            await asyncio.to_thread(os.unlink, cs_file)
         exe_file = cs_file.replace('.cs', '.exe')
-        if os.path.exists(exe_file):
-            os.unlink(exe_file)
+        if await asyncio.to_thread(os.path.exists, exe_file):
+            await asyncio.to_thread(os.unlink, exe_file)
 
 
-def pptx_tool(code: str, pptx_file_path: str) -> str:
+async def pptx_tool(code: str, pptx_file_path: str) -> str:
     """Execute C# code to modify a PowerPoint presentation.
     
     Args:
@@ -190,7 +200,7 @@ def pptx_tool(code: str, pptx_file_path: str) -> str:
     Returns:
         Success message or error description
     """
-    result = execute_csharp_code(code, pptx_file_path)
+    result = await execute_csharp_code(code, pptx_file_path)
     
     if result["success"]:
         return f"Code executed successfully. Output: {result['output']}"
@@ -250,7 +260,7 @@ async def tools_node(state: State, config: RunnableConfig) -> dict:
     for tool_call in last_message.tool_calls:
         if tool_call["name"] == "execute_pptx_code":
             # Execute the C# code
-            result = pptx_tool(
+            result = await pptx_tool(
                 code=tool_call["args"]["code"],
                 pptx_file_path=state.pptx_file_path
             )
