@@ -80,197 +80,94 @@ async def execute_csharp_code(code: str, pptx_file_path: str) -> dict:
     Returns:
         Dict with 'success' bool and 'output' or 'error' string
     """
+    # Get the path to the .NET project
+    project_dir = os.path.join(os.path.dirname(__file__), "PptxEditor")
+    program_file = os.path.join(project_dir, "Program.cs")
+    
     # Read the C# template
-    template_path = os.path.join(os.path.dirname(__file__), "pptx_template.cs")
-    if not await asyncio.to_thread(os.path.exists, template_path):
-        # Create a basic template if it doesn't exist
-        template_content = """#r "nuget: DocumentFormat.OpenXml, 3.0.0"
-
-using System;
-using System.Linq;
-using DocumentFormat.OpenXml.Packaging;
-using DocumentFormat.OpenXml.Presentation;
-using DocumentFormat.OpenXml;
-using P = DocumentFormat.OpenXml.Presentation;
-using D = DocumentFormat.OpenXml.Drawing;
-
-string filePath = Args[0];
-
-try
-{
-    using (PresentationDocument presentation = PresentationDocument.Open(filePath, true))
-    {
-        // USER_CODE_START
-        {CODE}
-        // USER_CODE_END
-        
-        Console.WriteLine("Successfully executed PowerPoint modifications");
-    }
-}
-catch (Exception ex)
-{
-    Console.WriteLine($"Error: {ex.Message}");
-    Environment.Exit(1);
-}
-"""
-        async with aiofiles.open(template_path, 'w') as f:
-            await f.write(template_content)
-    else:
-        async with aiofiles.open(template_path, 'r') as f:
-            template_content = await f.read()
-
+    async with aiofiles.open(program_file, 'r') as f:
+        template_content = await f.read()
+    
     # Replace the code placeholder
-    full_code = template_content.replace("{CODE}", code)
-
-    # Create a temporary C# file
-    def create_temp_file():
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.cs', delete=False) as f:
-            return f.name
-
-    cs_file = await asyncio.to_thread(create_temp_file)
-
-    async with aiofiles.open(cs_file, 'w') as f:
+    full_code = template_content.replace("// {CODE}", code)
+    
+    # Create a temporary directory for execution
+    temp_dir = await asyncio.to_thread(tempfile.mkdtemp)
+    temp_program = os.path.join(temp_dir, "Program.cs")
+    temp_project = os.path.join(temp_dir, "PptxEditor.csproj")
+    
+    # Copy the project file
+    project_file = os.path.join(project_dir, "PptxEditor.csproj")
+    await asyncio.to_thread(shutil.copy2, project_file, temp_project)
+    
+    # Write the modified Program.cs
+    async with aiofiles.open(temp_program, 'w') as f:
         await f.write(full_code)
 
     try:
-        # First check if dotnet-script is installed
-        check_result = await asyncio.to_thread(
+        # First restore packages
+        restore_result = await asyncio.to_thread(
             subprocess.run,
-            ['dotnet', 'tool', 'list', '--global'],
+            ['dotnet', 'restore', temp_project],
             capture_output=True,
-            text=True
+            text=True,
+            timeout=30,
+            cwd=temp_dir
         )
 
-        has_dotnet_script = 'dotnet-script' in check_result.stdout
-
-        if not has_dotnet_script:
-            # Try to run directly with dotnet run instead
-            # Create a simple project file
-            proj_content = """<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <TargetFramework>net9.0</TargetFramework>
-  </PropertyGroup>
-  <ItemGroup>
-    <PackageReference Include="DocumentFormat.OpenXml" Version="3.0.0" />
-  </ItemGroup>
-</Project>"""
-
-            # Create project in temp directory
-            temp_dir = await asyncio.to_thread(tempfile.mkdtemp)
-            proj_file = os.path.join(temp_dir, "temp.csproj")
-            cs_file_in_dir = os.path.join(temp_dir, "Program.cs")
-
-            # Write project file
-            async with aiofiles.open(proj_file, 'w') as f:
-                await f.write(proj_content)
-
-            # Modify the code to have a proper Main method
-            modified_code = full_code.replace(
-                '#r "nuget: DocumentFormat.OpenXml, 3.0.0"\n\n', '')
-            modified_code = modified_code.replace('string filePath = Args[0];', '''public class Program
-{
-    public static void Main(string[] args)
-    {
-        if (args.Length < 1)
-        {
-            Console.WriteLine("Error: Please provide the PowerPoint file path");
-            Environment.Exit(1);
-        }
-        string filePath = args[0];''')
-            modified_code = modified_code.rstrip() + '\n    }\n}'
-
-            # Write the C# file
-            async with aiofiles.open(cs_file_in_dir, 'w') as f:
-                await f.write(modified_code)
-
-            # First restore packages
-            restore_result = await asyncio.to_thread(
-                subprocess.run,
-                ['dotnet', 'restore', proj_file],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                cwd=temp_dir
-            )
-
-            if restore_result.returncode != 0:
-                await asyncio.to_thread(shutil.rmtree, temp_dir)
-                return {"success": False, "error": f"Package restore failed: {restore_result.stderr}"}
-
-            # Build first to get better error messages
-            build_result = await asyncio.to_thread(
-                subprocess.run,
-                ['dotnet', 'build', proj_file, '--no-restore'],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                cwd=temp_dir
-            )
-
-            if build_result.returncode != 0:
-                # Read the generated C# file to help debug
-                async with aiofiles.open(cs_file_in_dir, 'r') as f:
-                    generated_code = await f.read()
-                await asyncio.to_thread(shutil.rmtree, temp_dir)
-                # Get line numbers for better error reporting
-                lines = generated_code.split('\n')
-                numbered_lines = [f"{i+1}: {line}" for i, line in enumerate(lines)]
-                code_with_lines = '\n'.join(numbered_lines[:50])  # Show first 50 lines
-                
-                return {"success": False, "error": f"Build failed:\n{build_result.stderr}\n{build_result.stdout}\n\nGenerated code (first 50 lines):\n{code_with_lines}"}
-
-            # Run with dotnet run
-            result = await asyncio.to_thread(
-                subprocess.run,
-                ['dotnet', 'run', '--project', proj_file,
-                    '--no-build', '--', pptx_file_path],
-                capture_output=True,
-                text=True,
-                timeout=60,
-                cwd=temp_dir
-            )
-
-            # Clean up temp directory
+        if restore_result.returncode != 0:
             await asyncio.to_thread(shutil.rmtree, temp_dir)
+            return {"success": False, "error": f"Package restore failed: {restore_result.stderr}"}
 
-        else:
-            # Try to run with dotnet script
-            result = await asyncio.to_thread(
-                subprocess.run,
-                ['dotnet', 'script', cs_file, '--', pptx_file_path],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
+        # Build first to get better error messages
+        build_result = await asyncio.to_thread(
+            subprocess.run,
+            ['dotnet', 'build', temp_project, '--no-restore'],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=temp_dir
+        )
+
+        if build_result.returncode != 0:
+            # Read the generated C# file to help debug
+            async with aiofiles.open(temp_program, 'r') as f:
+                generated_code = await f.read()
+            await asyncio.to_thread(shutil.rmtree, temp_dir)
+            # Get line numbers for better error reporting
+            lines = generated_code.split('\n')
+            numbered_lines = [f"{i+1}: {line}" for i, line in enumerate(lines)]
+            code_with_lines = '\n'.join(numbered_lines[:50])  # Show first 50 lines
+            
+            return {"success": False, "error": f"Build failed:\n{build_result.stderr}\n{build_result.stdout}\n\nGenerated code (first 50 lines):\n{code_with_lines}"}
+
+        # Run with dotnet run
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ['dotnet', 'run', '--project', temp_project,
+                '--no-build', '--', pptx_file_path],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=temp_dir
+        )
+
+        # Clean up temp directory
+        await asyncio.to_thread(shutil.rmtree, temp_dir)
 
         if result.returncode == 0:
             return {"success": True, "output": result.stdout}
         else:
-            # If dotnet script fails, provide helpful error message
             error_msg = result.stderr or result.stdout
-
-            # Check if it's a missing package error
-            if "DocumentFormat.OpenXml" in error_msg:
-                return {"success": False, "error": "DocumentFormat.OpenXml package not found. Please install it:\n1. Run: dotnet tool install -g dotnet-script\n2. Create a script.csx file with: #r \"nuget: DocumentFormat.OpenXml, 3.0.0\"\n3. Run: dotnet script script.csx to install the package"}
-
-            # Check if dotnet script is not installed
-            if "dotnet-script" in error_msg or "No executable found" in error_msg:
-                return {"success": False, "error": "dotnet-script not installed. Please run: dotnet tool install -g dotnet-script"}
-
             return {"success": False, "error": f"Execution error: {error_msg}"}
 
     except subprocess.TimeoutExpired:
-        return {"success": False, "error": "Code execution timed out after 30 seconds"}
+        await asyncio.to_thread(shutil.rmtree, temp_dir)
+        return {"success": False, "error": "Code execution timed out after 60 seconds"}
     except Exception as e:
+        if await asyncio.to_thread(os.path.exists, temp_dir):
+            await asyncio.to_thread(shutil.rmtree, temp_dir)
         return {"success": False, "error": str(e)}
-    finally:
-        # Clean up temporary files
-        if await asyncio.to_thread(os.path.exists, cs_file):
-            await asyncio.to_thread(os.unlink, cs_file)
-        exe_file = cs_file.replace('.cs', '.exe')
-        if await asyncio.to_thread(os.path.exists, exe_file):
-            await asyncio.to_thread(os.unlink, exe_file)
 
 
 async def pptx_tool(code: str, pptx_file_path: str) -> str:
