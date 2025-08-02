@@ -67,6 +67,12 @@ var slide = slidePart.Slide;
 // Your modifications here
 ```
 
+## Common PowerPoint Structure Rules
+<!-- This section will grow as new validation errors are encountered -->
+To avoid validation errors, remember these structural requirements:
+
+1. **Shape Tree (spTree) Requirements**: Every spTree element must contain its required child elements, including nvGrpSpPr (non-visual group shape properties). Never remove these required elements when modifying slide content.
+
 Always be conversational and helpful in your responses."""
 
 
@@ -157,6 +163,10 @@ async def execute_csharp_code(code: str, pptx_file_path: str) -> dict:
 
         if result.returncode == 0:
             return {"success": True, "output": result.stdout}
+        elif result.returncode == 2:
+            # Validation error - parse the validation messages
+            validation_errors = result.stdout
+            return {"success": False, "error": f"Validation failed - the modifications would corrupt the PowerPoint file:\n{validation_errors}"}
         else:
             error_msg = result.stderr or result.stdout
             return {"success": False, "error": f"Execution error: {error_msg}"}
