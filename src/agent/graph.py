@@ -17,8 +17,11 @@ from typing import Annotated, Literal, Optional, Sequence
 import aiofiles
 from langchain_core.messages import AnyMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, add_messages
+from langgraph.prebuilt import InjectedState, ToolNode
+from typing_extensions import Annotated as TypeAnnotated
 
 
 def preserve_value(current, update):
@@ -51,11 +54,14 @@ When editing PowerPoint files:
 5. If an error occurs, explain it in user-friendly terms and then try to fix once only. If it fails again, provide explanation and then end, no more retries.
 
 When generating C# code:
-- Assume the PresentationDocument is already open and available as 'presentation'
+- Your code will be injected inside a Main method with the PresentationDocument already open as 'presentation'
+- DO NOT include 'using' statements - all necessary namespaces are already imported
+- DO NOT use 'return' statements - use Console.WriteLine() to output results
+- Available namespaces: System, System.Linq, DocumentFormat.OpenXml.Packaging, DocumentFormat.OpenXml.Presentation, DocumentFormat.OpenXml
+- Namespace aliases available: P = DocumentFormat.OpenXml.Presentation, D = DocumentFormat.OpenXml.Drawing
 - The slide collection is available as 'presentation.PresentationPart.Presentation.SlideIdList'
 - Use 0-based indexing for slides (slide 1 = index 0)
 - Include appropriate null checks
-- Focus on the specific changes requested for each slide
 
 Example code structure:
 ```csharp
@@ -65,6 +71,7 @@ var slidePart = presentation.PresentationPart.GetPartById(slideId.RelationshipId
 var slide = slidePart.Slide;
 
 // Your modifications here
+Console.WriteLine("Operation completed successfully");
 ```
 
 ## Common PowerPoint Structure Rules
@@ -180,16 +187,24 @@ async def execute_csharp_code(code: str, pptx_file_path: str) -> dict:
         return {"success": False, "error": str(e)}
 
 
-async def pptx_tool(code: str, pptx_file_path: str) -> str:
-    """Execute C# code to modify a PowerPoint presentation.
-
+@tool
+async def execute_pptx_code(
+    code: str,
+    state: TypeAnnotated[State, InjectedState]
+) -> str:
+    """Execute C# code to modify the PowerPoint presentation.
+    
     Args:
-        code: C# code that modifies the presentation (will be executed within a template)
-        pptx_file_path: Path to the PowerPoint file to modify
-
+        code: C# code to execute (will be run inside a template with presentation already open)
+        state: The graph state (injected automatically)
+    
     Returns:
         Success message or error description
     """
+    pptx_file_path = state.pptx_file_path
+    if not pptx_file_path:
+        return "Error: No PowerPoint file path provided in state"
+    
     result = await execute_csharp_code(code, pptx_file_path)
 
     if result["success"]:
@@ -205,26 +220,7 @@ async def llm_node(state: State, config: RunnableConfig) -> dict:
 
     # Bind the tool with the current file path
     if state.pptx_file_path:
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "execute_pptx_code",
-                    "description": "Execute C# code to modify the PowerPoint presentation",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "code": {
-                                "type": "string",
-                                "description": "C# code to execute (will be run inside a template with presentation already open)"
-                            }
-                        },
-                        "required": ["code"]
-                    }
-                }
-            }
-        ]
-        llm_with_tools = llm.bind_tools(tools)
+        llm_with_tools = llm.bind_tools([execute_pptx_code])
     else:
         llm_with_tools = llm
 
@@ -237,32 +233,8 @@ async def llm_node(state: State, config: RunnableConfig) -> dict:
     return {"messages": [response]}
 
 
-async def tools_node(state: State, config: RunnableConfig) -> dict:
-    """Execute the tools called by the LLM."""
-    # Get the last message (should be from AI with tool calls)
-    last_message = state.messages[-1]
-
-    if not hasattr(last_message, 'tool_calls') or not last_message.tool_calls:
-        return {"messages": []}
-
-    tool_messages = []
-
-    for tool_call in last_message.tool_calls:
-        if tool_call["name"] == "execute_pptx_code":
-            # Execute the C# code
-            result = await pptx_tool(
-                code=tool_call["args"]["code"],
-                pptx_file_path=state.pptx_file_path
-            )
-
-            # Create tool message with result
-            tool_message = ToolMessage(
-                content=result,
-                tool_call_id=tool_call["id"]
-            )
-            tool_messages.append(tool_message)
-
-    return {"messages": tool_messages}
+# Create the ToolNode with our decorated tool
+tools_node = ToolNode([execute_pptx_code])
 
 
 def should_continue(state: State) -> Literal["tools", "end"]:
@@ -281,7 +253,7 @@ def should_continue(state: State) -> Literal["tools", "end"]:
 # Build the graph
 workflow = StateGraph(State)
 
-# Add nodes
+# Add nodes  
 workflow.add_node("llm", llm_node)
 workflow.add_node("tools", tools_node)
 
